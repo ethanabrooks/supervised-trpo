@@ -1,0 +1,261 @@
+\documentclass{article}
+\usepackage{amsfonts, amsmath, amssymb, todonotes, titlesec, graphicx}
+\usepackage{mathtools}
+\usepackage[utf8]{inputenc}
+\usepackage[english]{babel} 
+\usepackage{apxproof}
+\usepackage{hyperref}
+\usepackage{tikz}
+
+
+\newcommand{\prob}[2] {P_{#1}\left(#2\right)}
+\newcommand{\set}[1]{\left\{#1\right\}}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\defeq}{\vcentcolon=}
+\newcommand{\eqdef}{=\vcentcolon}
+\newcommand{\dequal}{\overset{d}{=}}
+\newcommand{\states}{\mathcal{S}}
+\newcommand{\actions}{\mathcal{A}}
+\newcommand{\transitions}[1][ss']{\mathcal{P}_{#1}^a}
+\newcommand{\realscalars}{\mathbb{R}}
+\newcommand{\realvectors}[1]{\mathbb{R}^{#1}}
+\newcommand{\grad}[1] {\nabla_{#1}}
+\newcommand{\loss}{\mathcal{L}}
+\newcommand{\del}{\nabla}
+\newcommand{\real}{\mathbb{R}}
+\newcommand{\fisher}{\mathcal{F}}
+\newcommand{\Dt}{\Delta \theta}
+\newcommand{\dt}{\nabla_{\theta}}
+\newcommand{\ALPHA}{\boldsymbol{\alpha}}
+\newcommand{\E}[2] {E_{#1}\left[#2\right]}
+\newcommand{\tasks}{\mathcal{T}}
+\DeclarePairedDelimiterX{\infdivx}[2]{(}{)}{%
+  #1\;\delimsize\|\;#2%
+}
+\newcommand{\infdiv}{D\infdivx}
+\DeclarePairedDelimiter{\norm}{\lVert}{\rVert}
+\newcommand{\abs}[1]{\left\lVert#1\right\rVert}
+\newcommand{\Dkl}{\mathcal{D}\infdivx}
+\newtheorem{theorem}{Theorem}
+\newtheoremrep{theorem}{Theorem}
+\DeclareMathOperator*{\argmax}{arg\,max}
+\DeclareMathOperator*{\argmin}{arg\,min}
+\DeclareMathOperator*{\unif}{unif}
+\bibliographystyle{unsrt}
+
+\begin{document}
+Trust Region Policy Optimization (TRPO) \cite{trpo} is an on-policy algorithm that
+guarantees monotonic policy improvement. 
+TRPO optimizes the following loss:
+\begin{gather}
+	\label{opt}
+	\max_\theta\E{s\sim\rho_\pi, a\sim\pi(\cdot|s)}{\frac{\pi_\theta(a|s)}{\pi(a|s)}Q^\pi(s, a)}
+	\intertext{subject to }
+	\label{constraint}
+	\E{s\sim\rho_\pi}{\Dkl{\pi(\cdot|s)}{\pi_\theta(\cdot|s)}} < \delta
+\end{gather}
+where $\pi$ is the old policy, $\pi_\theta$ is the updated policy, and
+$\rho_\pi$ is the (unnormalized) discounted visitation frequencies under policy
+$\pi$.
+Solving this constrained optimization problem entails inverting the
+Fisher-Information matrix corresponding to the KL Divergence between the old and
+new policy.
+This matrix inversion hurts performance, and complicates
+implementation. 
+
+Proximal Policy Optimization \cite{ppo} proposes a variation on TRPO that avoids
+matrix inversion with the following loss function:
+\begin{align}
+  \E{s\sim\rho_\pi,
+  a\sim\pi(\cdot|s)}{CLIP\left(\frac{\pi_\theta(a|s)}{\pi(a|s)}, 1 - \epsilon, 1
++ \epsilon\right)Q^\pi(s, a)}
+\intertext{with}
+CLIP(x, a, b) = \begin{cases}
+  x & \text{if $a < x < b$} \\
+  a & \text{if $x \le a$} \\
+  b & \text{if $x \ge b$} \\
+\end{cases}
+\end{align}
+The $CLIP$ constraint approximately enforces the TRPO constraint (expression
+\ref{constraint}).
+In most implementations, PPO performs multiple small gradient steps on each
+batch of experience. Per the loss function, each step is collinear with the
+unconstrained gradient until $\abs{1 - \pi_\theta(a|s)/\pi(a|s)} >
+\epsilon$, at which point the gradient becomes 0.
+
+PPO demonstrates strong empirical performance and avoids many of the
+implementation and performance pitfalls of TRPO. However, unlike TRPO, the PPO
+gradient step is suboptimal:
+\begin{enumerate}
+  \item The policy update can violate the TRPO
+constraint for one step (since the PPO loss function is only evaluated at the
+current parameters). In principle, this forces PPO to use a smaller
+learning rate than it would have to otherwise and perform many time-intensive
+gradient calculations.
+\item Once the $CLIP$ constraint is violated, the gradient goes to zero, despite
+  the fact that in general, it may be possible to continue improving the policy
+  without increasing KL Divergence (by stepping the parameters along the level
+  curve of the KL Divergence). This results in idle GPU units when
+  a batch of experiences includes a mix of clipped and unclipped ratios.
+\item The direction of the parameter update is suboptimal. In general, the
+  vector to
+  the optimal parameters within the feasible set will not be collinear with the
+  unconstrained gradient vector (the gradient of expression \ref{opt}). On the contrary, it will be the vector that
+  maximizes the \textit{projection} along the unconstrained gradient. The
+  optimal gradient is only collinear with the unconstrained gradient when the
+  Fisher Information is collinear with the identity matrix, which in general is
+  not true.
+\end{enumerate}
+
+We propose an alternate algorithm that combines the advantages of TRPO --
+provably monotonic policy improvement, with the advantages of PPO -- simple
+implentation and fast performance.
+The key idea is that expression \ref{opt} is convex in $\pi_\theta$ and
+therefore one can analytically compute the optimal policy. With this in hand,
+the actual policy can be trained to match the optimal policy using supervised
+learning.
+\begin{theoremrep}
+	Let $\pi$ indicate the current (or old) policy and let $\pi_\theta$ indicate
+	the updated policy. Then
+	\begin{align}
+    \pi_\theta(a|s) = & \frac{\alpha\pi(a|s)}{\alpha - A^\pi(s, a)}
+	\end{align}
+	optimizes the TRPO equations, where $A^\pi(s, a) = Q^\pi(s, a) - V^\pi(s)$ and
+  $\alpha$ is a normalizing constant.
+\end{theoremrep}
+\begin{proof}
+Equation \ref{opt} is convex in $\pi_\theta$ under the assumption that all rewards are positive.
+In this case, the Karush-Kuhn-Tucker Conditions are necessary conditions for
+optimality.
+
+For each $(s, a) \in
+	\states \times \actions$:
+\begin{align}
+	 & \grad{\pi_\theta(a|s)}\E{s'\sim\rho_\pi,
+		a'\sim\pi(\cdot|s')}{\frac{\pi_\theta(a'|s')}{\pi(a'|s')}Q^\pi(s', a')}
+	\\
+	\begin{split}
+		&\quad =                 \grad{\pi_\theta(a|s)}
+		\mu\left(\E{s'\sim\rho_\pi}{\Dkl{\pi(\cdot|s')}{\pi_\theta(\cdot|s')}} - \delta\right)
+		\\
+    &\quad -
+    \grad{\pi_\theta(a|s)}\sum_{s'\in\states}\sum_{a'\in\actions}\mu_{s',
+    a'}\pi_\theta(a'|s')
+    \\
+		&\quad +                  \grad{\pi_\theta(a|s)}\sum_{s'\in\states}\lambda_{s'}\left(1-
+		\sum_{a'\in\actions}\pi_\theta(a'|s')\right)
+	\end{split}
+\end{align}
+where the last two terms relate to the simplex constraints.
+Then the left side is $\rho_\pi(s)Q^\pi(s, a)$. The first term on the
+right is
+\begin{align}
+	 & \mu\rho_\pi(s)\grad{\pi_\theta(a| s)}\left(\sum_{a' \in
+			\actions}\pi(a'|s)\left[\log\pi(a'|s) - \log\pi_\theta(a'|s) \right] - \delta\right)
+	\\
+	 & \quad =                 -\mu\rho_\pi(s)\frac{\pi(a|s)}{\pi_\theta(a|s)}
+\end{align}
+The last two terms on the right are $-\mu_{s,a} + \lambda_s$. Thus we have two cases: either the
+KL Divergence constraint is inactive, in which case $\mu= 0$ and
+\begin{align}
+	\pi_\theta(a|s) & = \begin{cases}
+		1 & \text{if } a = \argmax_{a' \in \actions}Q^\pi(s, a')
+		\\
+		0 & \text{otherwise}
+	\end{cases}
+	\intertext{Or the constraint is active, $\mu > 0$, and}
+	\label{def1}
+    \pi_\theta(a|s) & = \frac{\mu\pi(a|s)}{\lambda_{s, a} - Q^\pi(s, a) }
+\end{align}
+where $\lambda_{s, a} \defeq (\lambda_s - \mu_{s, a})/\rho_\pi(s) $.
+Turning our attention now to the KL Divergence constraint, we have
+\begin{align}
+  \delta \ge& 
+\E{s\sim\rho_\pi, a\sim\pi}{\log\pi(a|s) - \log\pi_\theta(a|s) }
+\intertext{Focusing on the inner expectation over $a\sim\pi$, we have}
+       &\E{}{\log\pi(\cdot|s) - \left(\log\mu + \log\pi(\cdot|s)-
+       \log(\lambda(s, \cdot) - Q^\pi(s, \cdot))\right) }
+       \\
+  =& 
+       \E{}{\log(\lambda(s, \cdot) - Q^\pi(s, \cdot)) } - \log\mu
+       \\
+  =& \log\E{a\sim\pi}{X_{s, a}} - \E{a\sim\pi}{\log X_{s, a}}
+       \label{pre-taylor}
+\end{align}
+where $X_{s, a} \defeq (\lambda_{s, a} - Q^\pi(s, a))^{-1}$. For brevity, we
+omit the $s, a$ subscript inside expectations over $a\sim\pi$.
+Note that the first simplex constraint tells us that, for any $s\in\states$,
+\begin{align}
+  \sum_{a\in\actions}\frac{\mu\pi(a|s)}{\lambda_{s, a} - Q^\pi(s, a) } &= 1
+\end{align}
+Therefore,
+\begin{equation}
+  \frac{1}{\mu} =
+  \E{a\sim\pi(\cdot|s)}{(\lambda_{s, a} - Q^\pi(s, a))^{-1}} = \E{}{X}
+\end{equation}
+and
+\begin{equation}
+  \pi_\theta(a|s) = \frac{X_{s, a}\pi(a|s)}{\E{}{X}}
+\end{equation}
+We now reformulate the original optimization problem in terms of $X$:
+\begin{align}
+  &\max_{\pi_\theta(a|s)}
+  \E{s'\sim\rho_\pi}{\sum_{a'\in\actions}\frac{\mu\pi(a'|s')Q^\pi(s',
+      a')}{\lambda_{s', a'} -
+  Q^\pi(s', a')}}
+  \\
+  =
+  &\max_{X_{s, a}} \E{s'\sim\rho_\pi}{\frac{\E{a'\sim\pi}{X_{s',
+        a'}Q^\pi(s',
+  a')}}{\E{a'\sim\pi}{X_{s', a'}}}} \label{opt2}
+\end{align}
+and incorporating the result from \ref{pre-taylor}:
+\begin{align}
+  \E{s\sim\rho_\pi}{\log\E{a\sim\pi}{X_{s, a}} - \E{a\sim\pi}{\log X_{s, a}}} \le \delta
+  \label{constraint2}
+\end{align}
+Again, the problem is convex and therefore we can use Lagrange multipliers.
+Per the Fritz John conditions,
+\begin{align}
+  \begin{split}
+  0 &=-\grad{X_{s, a}}\E{s'\sim\rho_\pi}{\frac{\E{}{X_{s', \cdot}Q^\pi(s',
+  \cdot)}}{\E{}{X_{s', \cdot}}}}\\
+  &\quad+ \alpha \left(\grad{X_{s, a}} \left(\delta -
+      \E{s'\sim\rho_\pi}{\log\E{a'\sim\pi}{X_{s', a'}} -
+    \E{a'\sim\pi}{\log X_{s', a'}}}\right) \right)
+    \label{fritz-john}
+  \end{split}
+  \\
+  &=-\rho_\pi(s)\frac{\pi(a|s)Q^\pi(s, a)E{}{X} -
+\E{}{X_{s, \cdot}Q^\pi(s, \cdot)}\pi(a|s)}{\E{}{X}^2}
+\\
+  &\quad-\alpha\rho_\pi(s)\left(\frac{\pi(a|s)}{\E{}{X}} -
+  \frac{\pi(a|s)}{X_{s, a}}\right) \label{grad-constraint2}
+  \\
+  &=\frac{Q^\pi(s, a)E{}{X} -
+\E{}{X_{s, \cdot}Q^\pi(s, \cdot)}}{\E{}{X}^2}
+    +\alpha\left(\frac{1}{\E{}{X}} -
+  \frac{1}{X_{s, a}}\right)
+\intertext{Multiplying by $\pi(a|s)X_{s, a}$,}
+  &=\pi_\theta(a|s)(Q^\pi(s, a) - \E{\pi_\theta}{Q(s, \cdot)}) 
+  + \alpha\left(\pi(a|s) - \pi_\theta(a|s)\right)
+\end{align}
+Rearranging,
+\begin{align}
+  \pi_\theta(a|s) 
+  &= \frac{\alpha\pi(a|s)}{\alpha - (Q^\pi(s, a) - \E{\pi_\theta}{Q^\pi(s, \cdot)})}
+  \\
+  &\approx \frac{\alpha\pi(a|s)}{\alpha - A^\pi(s, a)}
+  \label{final}
+\end{align}
+where $A^\pi(s, a) \defeq Q^\pi(s, a) - V^\pi(s)$. There is in general no
+closed form solution for $\alpha$. However, 
+\begin{align}
+  \left(\E{a\sim\pi}{\frac{\alpha}{\alpha - A^\pi(s, a)}} - 1\right)^2 
+\end{align}
+is convex in the ranges of $\alpha > A^\pi(s, a)$ and can therefore be approximated easily (e.g. with
+Frank-Wolfe or gradient descent).
+\end{proof}
+\bibliography{bib}
+\end{document}
+
